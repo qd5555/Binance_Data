@@ -6,7 +6,7 @@ from datetime import datetime
 DB_URL = os.environ["DB_CONNECTION_STRING"]
 
 def get_klines(symbol="BTCUSDT", interval="1h", limit=1000):
-url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     resp = requests.get(url)
     resp.raise_for_status()
     return resp.json()
