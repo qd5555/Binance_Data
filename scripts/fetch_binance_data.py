@@ -5,7 +5,7 @@ from psycopg2.extras import execute_values
 from datetime import datetime
 
 DB_URL = os.environ["DB_CONNECTION_STRING"]
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "BULLAUSDT"]
 INTERVAL = "1h"
 
 def get_last_timestamp(symbol, cur):
