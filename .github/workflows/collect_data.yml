@@ -23,8 +23,3 @@ jobs:
         env:
           DB_CONNECTION_STRING: ${{ secrets.SUPABASE_URL }}
         run: python scripts/fetch_binance_data.py
-        
-      - name: Run funding rate script
-        env:
-          DB_CONNECTION_STRING: ${{ secrets.SUPABASE_URL }}
-        run: python scripts/fetch_funding_rate.py
