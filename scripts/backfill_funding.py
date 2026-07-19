@@ -6,7 +6,7 @@ from psycopg2.extras import execute_values
 from datetime import datetime
 
 DB_URL = os.environ["DB_CONNECTION_STRING"]
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "BULLAUSDT"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 START_DATE = datetime(2023, 1, 1)
 
 def get_funding_batch(symbol, start_time_ms):
