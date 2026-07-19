@@ -7,7 +7,7 @@ from datetime import datetime
 
 DB_URL = os.environ["DB_CONNECTION_STRING"]
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
-START_DATE = datetime(2025, 1, 1)
+START_DATE = datetime(2023, 1, 1)
 
 def get_funding_batch(symbol, start_time_ms):
     url = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&limit=1000&startTime={start_time_ms}"
