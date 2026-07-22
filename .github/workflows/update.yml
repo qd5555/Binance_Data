@@ -45,9 +45,3 @@ jobs:
           DB_CONNECTION_STRING: ${{ secrets.DB_CONNECTION_STRING }}
         run: |
           python scripts/fetch_metadata.py
-
-      - name: Update Market Cap
-        env:
-          DB_CONNECTION_STRING: ${{ secrets.DB_CONNECTION_STRING }}
-        run: |
-          python scripts/fetch_market_cap.py
