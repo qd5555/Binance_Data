@@ -1,115 +1,146 @@
 import os
 import time
-from datetime import timezone
-
-import psycopg2
 import requests
+import psycopg2
+
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from psycopg2.extras import execute_values
 
 # ============================================================
-# UPDATE BINANCE DAILY PRICE DATA
-#
-# Purpose:
-#     Incrementally update fact_price_volume.
-#
-# Timezone:
-#     UTC
-#
+# CONFIG
 # ============================================================
 
 DB_URL = os.environ["DB_CONNECTION_STRING"]
 
 INTERVAL = "1d"
 
-LIMIT = 1000
+BINANCE_URL = "https://data-api.binance.vision/api/v3/klines"
 
-SLEEP_SECONDS = 0.20
+MAX_WORKERS = 20
 
+REQUEST_TIMEOUT = 20
 
-# ------------------------------------------------------------
-# Binance API
-# ------------------------------------------------------------
+MAX_RETRY = 3
 
-def get_all_symbols():
+SLEEP_BETWEEN_RETRY = 2
 
-    url = "https://data-api.binance.vision/api/v3/exchangeInfo"
+# ============================================================
+# DATABASE
+# ============================================================
 
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
+def get_symbols(cur):
 
-    data = resp.json()
+    cur.execute("""
+        SELECT symbol
+        FROM dim_symbol
+        WHERE status='TRADING'
+        ORDER BY symbol
+    """)
 
-    symbols = [
-        s["symbol"]
-        for s in data["symbols"]
-        if s["status"] == "TRADING"
-        and s["quoteAsset"] == "USDT"
-    ]
-
-    symbols.sort()
-
-    return symbols
+    return [r[0] for r in cur.fetchall()]
 
 
-def get_new_klines(symbol, start_ms):
+def get_last_candle(cur):
+
+    cur.execute("""
+        SELECT
+            symbol,
+            MAX(open_time)
+        FROM fact_price_volume
+        GROUP BY symbol
+    """)
+
+    result = {}
+
+    for symbol, ts in cur.fetchall():
+
+        if ts is None:
+            result[symbol] = None
+
+        else:
+            result[symbol] = int(ts.timestamp() * 1000) + 1
+
+    return result
+
+
+# ============================================================
+# BINANCE
+# ============================================================
+
+def request_with_retry(url):
+
+    for attempt in range(MAX_RETRY):
+
+        try:
+
+            r = requests.get(
+                url,
+                timeout=REQUEST_TIMEOUT
+            )
+
+            r.raise_for_status()
+
+            return r.json()
+
+        except Exception:
+
+            if attempt == MAX_RETRY - 1:
+                raise
+
+            time.sleep(SLEEP_BETWEEN_RETRY)
+
+    return []
+
+
+def fetch_symbol(symbol, last_timestamp):
 
     url = (
-        "https://data-api.binance.vision/api/v3/klines"
+        f"{BINANCE_URL}"
         f"?symbol={symbol}"
         f"&interval={INTERVAL}"
-        f"&limit={LIMIT}"
-        f"&startTime={start_ms}"
+        f"&limit=2"
     )
 
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
+    if last_timestamp:
 
-    return resp.json()
+        url += f"&startTime={last_timestamp}"
 
+    try:
 
-# ------------------------------------------------------------
-# Database
-# ------------------------------------------------------------
+        rows = request_with_retry(url)
 
-def get_last_timestamp(symbol, cur):
+        values = []
 
-    cur.execute(
-        """
-        SELECT MAX(open_time)
-        FROM fact_price_volume
-        WHERE symbol = %s
-        """,
-        (symbol,),
-    )
+        for r in rows:
 
-    result = cur.fetchone()[0]
+            values.append(
+                (
+                    symbol,
+                    datetime.utcfromtimestamp(r[0] / 1000),
+                    r[1],
+                    r[2],
+                    r[3],
+                    r[4],
+                    r[5]
+                )
+            )
 
-    if result is None:
-        return None
+        return values
 
-    if result.tzinfo is None:
-        result = result.replace(tzinfo=timezone.utc)
+    except Exception as e:
 
-    return int(result.timestamp() * 1000) + 1
+        print(f"{symbol} : FAILED ({e})")
 
+        return []
+# ============================================================
+# SAVE
+# ============================================================
 
-def save_batch(symbol, rows, cur):
+def save_all_rows(cur, conn, rows):
 
     if not rows:
-        return
-
-    values = [
-        (
-            symbol,
-            rows[i][0] / 1000,
-            float(rows[i][1]),
-            float(rows[i][2]),
-            float(rows[i][3]),
-            float(rows[i][4]),
-            float(rows[i][5]),
-        )
-        for i in range(len(rows))
-    ]
+        return 0
 
     execute_values(
         cur,
@@ -124,37 +155,30 @@ def save_batch(symbol, rows, cur):
             close,
             volume
         )
-
         VALUES %s
 
         ON CONFLICT (symbol, open_time)
 
         DO UPDATE SET
 
-            open=EXCLUDED.open,
-            high=EXCLUDED.high,
-            low=EXCLUDED.low,
-            close=EXCLUDED.close,
-            volume=EXCLUDED.volume
+            open   = EXCLUDED.open,
+            high   = EXCLUDED.high,
+            low    = EXCLUDED.low,
+            close  = EXCLUDED.close,
+            volume = EXCLUDED.volume
         """,
-        [
-            (
-                v[0],
-                psycopg2.TimestampFromTicks(v[1]),
-                v[2],
-                v[3],
-                v[4],
-                v[5],
-                v[6],
-            )
-            for v in values
-        ],
+        rows,
+        page_size=500
     )
 
+    conn.commit()
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
+    return len(rows)
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
 
@@ -162,78 +186,99 @@ def main():
     print("BINANCE DAILY UPDATE")
     print("=" * 60)
 
-    symbols = get_all_symbols()
-
     conn = psycopg2.connect(DB_URL)
-
     cur = conn.cursor()
-
-    updated_symbols = 0
-    inserted_rows = 0
-    failed = []
 
     try:
 
-        for idx, symbol in enumerate(symbols, start=1):
+        # ---------------------------------------------
+        # Load symbols
+        # ---------------------------------------------
 
-            print(f"[{idx}/{len(symbols)}] {symbol}")
+        symbols = get_symbols(cur)
 
-            start_ms = get_last_timestamp(symbol, cur)
+        print(f"Trading symbols : {len(symbols)}")
 
-            if start_ms is None:
-                print("    No historical data. Skip.")
-                continue
+        # ---------------------------------------------
+        # Load last candle
+        # ---------------------------------------------
 
-            while True:
+        last_timestamp = get_last_candle(cur)
 
-                rows = get_new_klines(symbol, start_ms)
+        print("Last candle map loaded.")
 
-                if not rows:
-                    break
+        # ---------------------------------------------
+        # Download concurrently
+        # ---------------------------------------------
 
-                save_batch(symbol, rows, cur)
+        all_rows = []
 
-                conn.commit()
+        completed = 0
 
-                inserted_rows += len(rows)
+        print("\nDownloading new candles...\n")
 
-                print(f"    +{len(rows)} rows")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
 
-                if len(rows) < LIMIT:
-                    break
+            futures = {
 
-                start_ms = rows[-1][0] + 1
+                executor.submit(
+                    fetch_symbol,
+                    symbol,
+                    last_timestamp.get(symbol)
+                ): symbol
 
-                time.sleep(SLEEP_SECONDS)
+                for symbol in symbols
 
-            updated_symbols += 1
+            }
 
-    except KeyboardInterrupt:
+            for future in as_completed(futures):
 
-        print("\nInterrupted.")
+                symbol = futures[future]
 
-    except Exception as e:
+                rows = future.result()
 
-        print(e)
-        raise
+                if rows:
+
+                    all_rows.extend(rows)
+
+                completed += 1
+
+                if completed % 20 == 0 or completed == len(symbols):
+
+                    print(
+                        f"[{completed}/{len(symbols)}] "
+                        f"Collected rows : {len(all_rows)}"
+                    )
+
+        # ---------------------------------------------
+        # Save
+        # ---------------------------------------------
+
+        print("\nWriting to PostgreSQL...")
+
+        inserted = save_all_rows(
+            cur,
+            conn,
+            all_rows
+        )
+
+        print("\n")
+        print("=" * 60)
+        print("UPDATE COMPLETED")
+        print("=" * 60)
+
+        print(f"Symbols checked : {len(symbols)}")
+        print(f"Rows inserted   : {inserted}")
 
     finally:
 
         cur.close()
         conn.close()
 
-    print("\n")
 
-    print("=" * 60)
-    print("UPDATE COMPLETED")
-    print("=" * 60)
-
-    print(f"Updated symbols : {updated_symbols}")
-
-    print(f"Inserted rows   : {inserted_rows}")
-
-    print(f"Failed symbols  : {len(failed)}")
-
+# ============================================================
+# ENTRY
+# ============================================================
 
 if __name__ == "__main__":
 
