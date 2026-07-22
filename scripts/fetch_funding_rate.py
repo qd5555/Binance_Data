@@ -1,247 +1,314 @@
 import os
 import time
-from datetime import datetime, timezone
-
-import psycopg2
 import requests
+import psycopg2
+
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from psycopg2.extras import execute_values
 
+# ============================================================
+# CONFIG
+# ============================================================
+
 DB_URL = os.environ["DB_CONNECTION_STRING"]
-
-LIMIT = 1000
-
-SLEEP_SECONDS = 0.2
 
 EXCHANGE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 
 FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 
+MAX_WORKERS = 20
 
-# ----------------------------------------------------------
-# Futures symbols
-# ----------------------------------------------------------
+REQUEST_TIMEOUT = 20
 
-def get_symbols():
+MAX_RETRY = 3
 
-    r = requests.get(EXCHANGE_INFO_URL, timeout=30)
+RETRY_SLEEP = 2
 
-    r.raise_for_status()
-
-    data = r.json()
-
-    symbols = [
-
-        s["symbol"]
-
-        for s in data["symbols"]
-
-        if s["status"] == "TRADING"
-
-        and s["quoteAsset"] == "USDT"
-
-    ]
-
-    symbols.sort()
-
-    return symbols
+LIMIT = 1000
 
 
-# ----------------------------------------------------------
-# Database
-# ----------------------------------------------------------
+# ============================================================
+# DATABASE
+# ============================================================
 
-def get_last_timestamp(symbol, cur):
+def get_symbols(cur):
 
-    cur.execute(
+    cur.execute("""
+        SELECT symbol
+        FROM dim_symbol
+        WHERE status='TRADING'
+        ORDER BY symbol
+    """)
 
-        """
+    return [r[0] for r in cur.fetchall()]
 
-        SELECT MAX(funding_time)
 
+def get_last_funding(cur):
+
+    cur.execute("""
+        SELECT
+            symbol,
+            MAX(funding_time)
         FROM fact_funding_rate
+        GROUP BY symbol
+    """)
 
-        WHERE symbol=%s
+    result = {}
 
-        """,
+    for symbol, ts in cur.fetchall():
 
-        (symbol,),
+        if ts is None:
 
-    )
+            result[symbol] = None
 
-    result = cur.fetchone()[0]
+        else:
 
-    if result is None:
+            result[symbol] = int(ts.timestamp() * 1000) + 1
 
-        return None
-
-    if result.tzinfo is None:
-
-        result = result.replace(tzinfo=timezone.utc)
-
-    return int(result.timestamp() * 1000) + 1
+    return result
 
 
-# ----------------------------------------------------------
-# Binance API
-# ----------------------------------------------------------
+# ============================================================
+# HTTP
+# ============================================================
 
-def fetch_batch(symbol, start_ms=None):
+def request_with_retry(url, params):
+
+    for attempt in range(MAX_RETRY):
+
+        try:
+
+            r = requests.get(
+                url,
+                params=params,
+                timeout=REQUEST_TIMEOUT
+            )
+
+            r.raise_for_status()
+
+            return r.json()
+
+        except Exception:
+
+            if attempt == MAX_RETRY - 1:
+                raise
+
+            time.sleep(RETRY_SLEEP)
+
+    return []
+
+
+# ============================================================
+# DOWNLOAD ONE SYMBOL
+# ============================================================
+
+def fetch_symbol(symbol, last_timestamp):
 
     params = {
 
         "symbol": symbol,
 
-        "limit": LIMIT,
+        "limit": LIMIT
 
     }
 
-    if start_ms is not None:
+    if last_timestamp is not None:
 
-        params["startTime"] = start_ms
+        params["startTime"] = last_timestamp
 
-    r = requests.get(
+    try:
 
-        FUNDING_URL,
+        rows = request_with_retry(
+            FUNDING_URL,
+            params
+        )
 
-        params=params,
+        values = []
 
-        timeout=30,
+        for r in rows:
 
-    )
+            values.append(
 
-    r.raise_for_status()
+                (
 
-    return r.json()
+                    symbol,
 
+                    datetime.fromtimestamp(
 
-# ----------------------------------------------------------
-# Save
-# ----------------------------------------------------------
+                        int(r["fundingTime"]) / 1000,
 
-def save(rows, cur):
+                        tz=timezone.utc
 
-    if not rows:
+                    ),
 
-        return
+                    float(r["fundingRate"]),
 
-    values = []
+                    float(r["markPrice"])
 
-    for r in rows:
-
-        values.append(
-
-            (
-
-                r["symbol"],
-
-                datetime.fromtimestamp(
-
-                    int(r["fundingTime"]) / 1000,
-
-                    tz=timezone.utc,
-
-                ),
-
-                float(r["fundingRate"]),
-
-                float(r["markPrice"]),
+                )
 
             )
 
-        )
+        return values
+
+    except Exception as e:
+
+        print(f"{symbol} FAILED : {e}")
+
+        return []
+# ============================================================
+# SAVE
+# ============================================================
+
+def save_all_rows(cur, conn, rows):
+
+    if not rows:
+        return 0
 
     execute_values(
 
         cur,
 
         """
-
         INSERT INTO fact_funding_rate
-
         (
-
             symbol,
-
             funding_time,
-
             funding_rate,
-
             mark_price
-
         )
 
         VALUES %s
 
-        ON CONFLICT(symbol,funding_time)
+        ON CONFLICT(symbol, funding_time)
 
         DO UPDATE SET
 
-            funding_rate=EXCLUDED.funding_rate,
-
-            mark_price=EXCLUDED.mark_price
+            funding_rate = EXCLUDED.funding_rate,
+            mark_price   = EXCLUDED.mark_price
 
         """,
 
-        values,
+        rows,
+
+        page_size=500
 
     )
 
+    conn.commit()
 
-# ----------------------------------------------------------
-# Main
-# ----------------------------------------------------------
+    return len(rows)
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
 
     print("=" * 60)
-
-    print("FETCH BINANCE FUNDING RATE")
-
+    print("BINANCE FUNDING RATE UPDATE")
     print("=" * 60)
 
     conn = psycopg2.connect(DB_URL)
 
     cur = conn.cursor()
 
-    symbols = get_symbols()
-
-    success = 0
-
-    total_rows = 0
-
     try:
 
-        for idx, symbol in enumerate(symbols, start=1):
+        # ----------------------------------------------------
+        # Load symbols
+        # ----------------------------------------------------
 
-            print(f"[{idx}/{len(symbols)}] {symbol}")
+        symbols = get_symbols(cur)
 
-            start_ms = get_last_timestamp(symbol, cur)
+        print(f"Trading symbols : {len(symbols)}")
 
-            while True:
+        # ----------------------------------------------------
+        # Last funding map
+        # ----------------------------------------------------
 
-                rows = fetch_batch(symbol, start_ms)
+        last_funding = get_last_funding(cur)
 
-                if not rows:
+        print("Last funding map loaded.")
 
-                    break
+        # ----------------------------------------------------
+        # Download concurrently
+        # ----------------------------------------------------
 
-                save(rows, cur)
+        print("\nDownloading funding rates...\n")
 
-                conn.commit()
+        all_rows = []
 
-                total_rows += len(rows)
+        completed = 0
 
-                print(f"    +{len(rows)} rows")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
 
-                if len(rows) < LIMIT:
+            futures = {
 
-                    break
+                executor.submit(
+                    fetch_symbol,
+                    symbol,
+                    last_funding.get(symbol)
+                ): symbol
 
-                start_ms = int(rows[-1]["fundingTime"]) + 1
+                for symbol in symbols
 
-                time.sleep(SLEEP_SECONDS)
+            }
 
-            success += 1
+            for future in as_completed(futures):
+
+                symbol = futures[future]
+
+                try:
+
+                    rows = future.result()
+
+                    if rows:
+
+                        all_rows.extend(rows)
+
+                except Exception as e:
+
+                    print(f"{symbol} ERROR : {e}")
+
+                completed += 1
+
+                if completed % 20 == 0 or completed == len(symbols):
+
+                    print(
+
+                        f"[{completed}/{len(symbols)}] "
+
+                        f"Collected rows : {len(all_rows)}"
+
+                    )
+
+        # ----------------------------------------------------
+        # Save
+        # ----------------------------------------------------
+
+        print("\nWriting to PostgreSQL...")
+
+        inserted = save_all_rows(
+
+            cur,
+
+            conn,
+
+            all_rows
+
+        )
+
+        print()
+
+        print("=" * 60)
+        print("UPDATE COMPLETED")
+        print("=" * 60)
+
+        print(f"Symbols checked : {len(symbols)}")
+        print(f"Rows inserted   : {inserted}")
 
     finally:
 
@@ -249,18 +316,10 @@ def main():
 
         conn.close()
 
-    print()
 
-    print("=" * 60)
-
-    print("DONE")
-
-    print("=" * 60)
-
-    print(f"Symbols : {success}")
-
-    print(f"Rows    : {total_rows}")
-
+# ============================================================
+# ENTRY
+# ============================================================
 
 if __name__ == "__main__":
 
