@@ -31,7 +31,7 @@ jobs:
         env:
           DB_CONNECTION_STRING: ${{ secrets.DB_CONNECTION_STRING }}
         run: |
-          python scripts/fetch_binance_data.py
+          python scripts/fetch_price_volume.py
 
       - name: Update Funding Rate
         continue-on-error: true
