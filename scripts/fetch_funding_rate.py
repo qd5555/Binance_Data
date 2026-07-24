@@ -13,9 +13,9 @@ from psycopg2.extras import execute_values
 
 DB_URL = os.environ["DB_CONNECTION_STRING"]
 
-EXCHANGE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-
-FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
+BASE_URL = os.environ.get("BINANCE_PROXY_URL", "https://fapi.binance.com")
+EXCHANGE_INFO_URL = f"{BASE_URL}/fapi/v1/exchangeInfo"
+FUNDING_URL = f"{BASE_URL}/fapi/v1/fundingRate"
 
 MAX_WORKERS = 20
 
