@@ -30,6 +30,7 @@ jobs:
       - name: Update Binance Daily Price
         env:
           DB_CONNECTION_STRING: ${{ secrets.DB_CONNECTION_STRING }}
+          BINANCE_PROXY_URL: ${{ secrets.BINANCE_PROXY_URL }}
         run: |
           python scripts/fetch_price_volume.py
 
@@ -37,11 +38,13 @@ jobs:
         continue-on-error: true
         env:
           DB_CONNECTION_STRING: ${{ secrets.DB_CONNECTION_STRING }}
+          BINANCE_PROXY_URL: ${{ secrets.BINANCE_PROXY_URL }}
         run: |
           python scripts/fetch_funding_rate.py
 
       - name: Update Symbol Metadata
         env:
           DB_CONNECTION_STRING: ${{ secrets.DB_CONNECTION_STRING }}
+          BINANCE_PROXY_URL: ${{ secrets.BINANCE_PROXY_URL }}
         run: |
           python scripts/fetch_metadata.py
